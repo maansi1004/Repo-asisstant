@@ -1,0 +1,30 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment — NEVER push this
+.env
+
+# Vector store and ChromaDB — too large
+chroma_db/
+vector_store.json
+D:/chroma_db/
+
+# Temp files
+tmp/
+D:/tmp/
+
+# Node
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
