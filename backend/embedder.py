@@ -11,24 +11,39 @@ def embed_text(text: str) -> list[float]:
     return embedding.tolist()
 
 
+
+
 def embed_chunks(chunks: list[dict]) -> list[dict]:
-    embedded = []
+    if not chunks:
+        return []
+
     total = len(chunks)
-    print(f"Starting embedding of {total} chunks...")
+    print(f"Embedding {total} chunks in batches of 32...")
 
-    for i, chunk in enumerate(chunks):
-        try:
-            chunk["embedding"] = embed_text(chunk["text"])
-            embedded.append(chunk)
-            if i % 10 == 0:
-                print(f"Progress: {i+1}/{total} chunks embedded")
-        except Exception as e:
-            print(f"FAILED chunk {i+1}/{total}: {type(e).__name__}: {e}")
-            continue
+    texts = [c["text"] for c in chunks]
+    all_embeddings = []
 
-    print(f"Finished: {len(embedded)}/{total} chunks embedded successfully")
+    # Process 32 at a time instead of one by one
+    batch_size = 32
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        embeddings = model.encode(
+            batch,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=32
+        )
+        all_embeddings.extend(embeddings.tolist())
+        print(f"Embedded {min(i + batch_size, total)}/{total}")
+
+    # Attach embeddings back to chunks
+    embedded = []
+    for chunk, embedding in zip(chunks, all_embeddings):
+        chunk["embedding"] = embedding
+        embedded.append(chunk)
+
+    print(f"Done — {len(embedded)} chunks embedded")
     return embedded
-
 
 def embed_query(question: str) -> list[float]:
     query_text = f"Search query about code: {question}"

@@ -3,26 +3,23 @@ import zipfile
 import tempfile
 import shutil
 import json
-
-from fastapi import FastAPI, UploadFile, File, HTTPException, dependencies, security
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from importlib_resources import files
 from pydantic import BaseModel
-from summarizer import generate_repo_summary
-from onboarding import generate_onboarding
-from security_scanner import scan_security 
-from architect import generate_architecture, generate_mermaid_diagram
-
-
 import google.generativeai as genai
 from dotenv import load_dotenv
+
 from chunker import chunk_all_files
 from embedder import embed_chunks
-from store import save_chunks, reset_collection, get_all_chunks
+from store import save_chunks, reset_collection, get_all_chunks, chunk_count, load_store
 from retriever import retrieve, format_context
 from dependency_scanner import scan_dependencies
+from security_scanner import scan_security
+from summarizer import generate_repo_summary
+from architect import generate_architecture, generate_mermaid_diagram
+from onboarding import generate_onboarding
+
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -36,21 +33,40 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-SKIP_DIRS = {"node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build", ".next"}
-SKIP_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf",
-                   ".zip", ".tar", ".gz", ".mp4", ".mp3", ".woff", ".woff2",
-                   ".ttf", ".eot", ".lock", ".pyc"}
+# Load existing vectors on startup
+load_store()
 
-# Track upload status in memory (just metadata, not file contents like V1)
-upload_status = {"total_files": 0, "total_chunks": 0, "uploaded": False, "summary": None, "dependencies": None, "onboarding": None,"security": None, "diagram": None}
+SKIP_DIRS = {
+    "node_modules", ".git", "__pycache__", "venv",
+    ".venv", "dist", "build", ".next", ".idea", ".vscode"
+}
+SKIP_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf",
+    ".zip", ".tar", ".gz", ".mp4", ".mp3", ".woff", ".woff2",
+    ".ttf", ".eot", ".lock", ".pyc", ".exe", ".dll", ".bin"
+}
+
+# Central state — files kept in memory for lazy generation
+upload_status = {
+    "uploaded": False,
+    "total_files": 0,
+    "total_chunks": 0,
+    "file_list": [],
+    "files_content": {},   # raw file contents kept for lazy generation
+    # All generated data — None until first request
+    "summary": None,
+    "dependencies": None,
+    "security": None,
+    "architecture": None,
+    "diagram": None,
+    "onboarding": None,
+}
 
 
 def read_files_from_zip(zip_path: str, extract_to: str) -> dict:
-    """Extract zip and read all readable text files. Same as V1."""
     files = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(extract_to)
-
     for root, dirs, filenames in os.walk(extract_to):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
@@ -71,17 +87,20 @@ def read_files_from_zip(zip_path: str, extract_to: str) -> dict:
 @app.post("/upload")
 async def upload_repo(file: UploadFile = File(...)):
     """
-    Upload flow:
+    Upload flow — minimal, fast, no Gemini calls:
     1. Extract zip
-    2. Read all files
+    2. Read files
     3. Chunk by function boundary
-    4. Embed each chunk
-    5. Store in ChromaDB
+    4. Embed chunks locally
+    5. Save to ChromaDB
+    6. Run dependency scan (rule-based, instant)
+
+    Everything else (summary, security, diagram, onboarding)
+    is generated lazily on first request.
     """
     if not file.filename.endswith(".zip"):
         raise HTTPException(400, "Please upload a .zip file")
 
-    # tmp_dir = tempfile.mkdtemp()
     tmp_dir = tempfile.mkdtemp(dir="D:\\tmp")
     zip_path = os.path.join(tmp_dir, "repo.zip")
     extract_path = os.path.join(tmp_dir, "extracted")
@@ -97,67 +116,231 @@ async def upload_repo(file: UploadFile = File(...)):
         if not files:
             raise HTTPException(400, "No readable files found in the zip")
 
-        # Step 2: chunk all files
+        # Step 2: chunk
         print(f"Chunking {len(files)} files...")
         chunks = chunk_all_files(files)
         print(f"Created {len(chunks)} chunks")
 
-        # Step 3: embed all chunks
-        print("Embedding chunks (this takes 1-2 minutes for large repos)...")
+        # Step 3: embed
+        print("Embedding chunks...")
         embedded_chunks = embed_chunks(chunks)
         print(f"Embedded {len(embedded_chunks)} chunks")
 
-        # Step 4: reset old data and save new chunks
+        # Step 4: save
         reset_collection()
         save_chunks(embedded_chunks)
-        # Step 5: auto generate repo summary
-        print("Generating repo summary...")
-        summary = generate_repo_summary(files)
-           # Step 6: scan dependencies
+
+        # Step 5: dependency scan (free, rule-based — run immediately)
         print("Scanning dependencies...")
         deps = scan_dependencies(files)
-        upload_status["dependencies"] = deps
-        print(f"Found {deps['total_detected']} dependencies")
 
-        upload_status["summary"] = summary
-        print(f"Summary generated: {summary.get('project_name', 'Unknown')}")
+        # Reset all lazy-generated data
+        upload_status.update({
+            "uploaded": True,
+            "total_files": len(files),
+            "total_chunks": len(embedded_chunks),
+            "file_list": sorted(files.keys()),
+            "files_content": files,   # keep in memory for lazy generation
+            "summary": None,
+            "dependencies": deps,     # already computed, no cost
+            "security": None,
+            "architecture": None,
+            "diagram": None,
+            "onboarding": None,
+        })
 
-        upload_status["total_files"] = len(files)
-        upload_status["total_chunks"] = len(embedded_chunks)
-        upload_status["uploaded"] = True
-        # Step 8: generate onboarding guide
-        print("Generating onboarding guide...")
-        onboarding = generate_onboarding(
-        summary,
-        deps,
-        sorted(files.keys())
-         )
-        upload_status["onboarding"] = onboarding
-        print("Onboarding guide generated")
-        # Step 9: security scan
-        print("Running security scan...")
-        security_report = scan_security(files)
-        upload_status["security"] = security_report
-        print(f"Security scan done — score: {security_report['score']}/10, issues: {security_report['total_issues']}")
-        # Generate Mermaid diagram
-        print("Generating architecture diagram...")
-        diagram = generate_mermaid_diagram(summary, deps, sorted(files.keys()))
-        upload_status["diagram"] = diagram
-        print("Diagram generated")
+        print("Upload complete. All analysis available on demand.")
+
         return {
             "success": True,
             "total_files": len(files),
             "total_chunks": len(embedded_chunks),
             "files": sorted(files.keys()),
-            "summary": summary,
-            "onboarding": onboarding,
-            "security": security_report,
-            "diagram": diagram
+            "dependencies": deps,     # send deps immediately since it's free
         }
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+# ─── Lazy endpoints ────────────────────────────────────────────
+
+@app.get("/summary")
+def get_summary():
+    """Generates on first call, cached after that."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+
+    if not upload_status["summary"]:
+        print("Generating summary (first request)...")
+        upload_status["summary"] = generate_repo_summary(
+            upload_status["files_content"]
+        )
+
+    return upload_status["summary"]
+
+
+@app.get("/security")
+def get_security():
+    """Generates on first call (rule-based, no Gemini), cached after that."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+
+    if not upload_status["security"]:
+        print("Running security scan (first request)...")
+        upload_status["security"] = scan_security(
+            upload_status["files_content"]
+        )
+
+    return upload_status["security"]
+
+
+@app.get("/dependencies")
+def get_dependencies():
+    """Already computed during upload — instant."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+    if not upload_status["dependencies"]:
+        raise HTTPException(404, "Dependencies not available.")
+    return upload_status["dependencies"]
+
+
+@app.get("/architecture")
+def get_architecture():
+    """Generates on first call, cached after that."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+
+    if not upload_status["architecture"]:
+        # Need summary first
+        if not upload_status["summary"]:
+            upload_status["summary"] = generate_repo_summary(
+                upload_status["files_content"]
+            )
+        print("Generating architecture (first request)...")
+        upload_status["architecture"] = generate_architecture(
+            upload_status["summary"],
+            upload_status["dependencies"] or {}
+        )
+
+    return upload_status["architecture"]
+
+
+@app.get("/diagram")
+def get_diagram():
+    """Generates on first call, cached after that."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+
+    if not upload_status["diagram"]:
+        # Need summary + deps first
+        if not upload_status["summary"]:
+            upload_status["summary"] = generate_repo_summary(
+                upload_status["files_content"]
+            )
+        print("Generating diagram (first request)...")
+        upload_status["diagram"] = generate_mermaid_diagram(
+            upload_status["summary"],
+            upload_status["dependencies"] or {},
+            upload_status["file_list"]
+        )
+
+    return upload_status["diagram"]
+
+
+@app.get("/onboard")
+def get_onboarding():
+    """Generates on first call, cached after that."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+
+    if not upload_status["onboarding"]:
+        if not upload_status["summary"]:
+            upload_status["summary"] = generate_repo_summary(
+                upload_status["files_content"]
+            )
+        print("Generating onboarding guide (first request)...")
+        upload_status["onboarding"] = generate_onboarding(
+            upload_status["summary"],
+            upload_status["dependencies"] or {},
+            upload_status["file_list"]
+        )
+
+    return upload_status["onboarding"]
+
+
+@app.get("/status")
+def status():
+    count = chunk_count()
+    return {
+        "repo_loaded": upload_status["uploaded"],
+        "total_files": upload_status["total_files"],
+        "total_chunks": upload_status["total_chunks"],
+        "chunks_in_store": count,
+        "ready": count > 0,
+        "cached": {
+            "summary": upload_status["summary"] is not None,
+            "security": upload_status["security"] is not None,
+            "architecture": upload_status["architecture"] is not None,
+            "diagram": upload_status["diagram"] is not None,
+            "onboarding": upload_status["onboarding"] is not None,
+        }
+    }
+
+
+@app.get("/explain")
+async def explain_file(filepath: str):
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+
+    chunks = get_all_chunks()
+    normalized_input = filepath.replace("\\\\", "\\").replace("/", "\\")
+    file_chunks = [
+        c for c in chunks
+        if c["metadata"]["filepath"].replace("/", "\\") == normalized_input
+    ]
+
+    if not file_chunks:
+        available = sorted(set(c["metadata"]["filepath"] for c in chunks))
+        raise HTTPException(404, {
+            "error": f"File '{filepath}' not found",
+            "available_files": available[:10]
+        })
+
+    file_content = "\n\n".join([c["text"] for c in file_chunks])
+
+    prompt = f"""Analyze this file:
+
+{file_content}
+
+Return as JSON:
+{{
+    "purpose": "what this file does",
+    "functions": [{{"name": "fn", "description": "what it does"}}],
+    "dependencies": ["import and why"],
+    "connections": "how it connects to the codebase",
+    "complexity": 5,
+    "complexity_reason": "why"
+}}
+Return only valid JSON, no markdown backticks."""
+
+    try:
+        gemini = genai.GenerativeModel("gemini-2.0-flash")
+        response = gemini.generate_content(prompt)
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        structured = json.loads(raw.strip())
+        return {"filepath": filepath, "chunks_analyzed": len(file_chunks), **structured}
+    except json.JSONDecodeError:
+        return {"filepath": filepath, "chunks_analyzed": len(file_chunks), "explanation": response.text}
+    except Exception as e:
+        raise HTTPException(500, f"Gemini error: {str(e)}")
+
+
+# ─── Q&A endpoint ──────────────────────────────────────────────
 
 class QuestionRequest(BaseModel):
     question: str
@@ -166,50 +349,42 @@ class QuestionRequest(BaseModel):
 @app.post("/ask")
 async def ask_question(body: QuestionRequest):
     if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet. Please upload a zip first.")
-
+        raise HTTPException(400, "No repo uploaded yet.")
     if not body.question.strip():
         raise HTTPException(400, "Question cannot be empty")
 
     chunks = retrieve(body.question)
     if not chunks:
-        raise HTTPException(500, "Could not retrieve relevant chunks. Try re-uploading the repo.")
+        raise HTTPException(500, "Could not retrieve relevant chunks.")
 
     context, filepaths = format_context(chunks)
 
-    prompt = f"""You are a senior software engineer doing a deep code review.
+    prompt = f"""You are a senior software engineer analyzing a codebase.
 
-CODEBASE CONTEXT:
+RELEVANT CODE SECTIONS:
 {context}
 
 QUESTION: {body.question}
 
-Return your response as valid JSON in exactly this format:
+Return valid JSON:
 {{
-    "direct_answer": "one sentence direct answer with exact file and function names",
-    "explanation": "detailed step by step explanation of the actual code flow referencing specific functions",
-    "code_evidence": ["code snippet 1 with filepath", "code snippet 2 with filepath"],
+    "direct_answer": "one sentence answer with exact file and function names",
+    "explanation": "detailed step by step explanation",
+    "code_evidence": ["code snippet 1 with filepath", "code snippet 2"],
     "confidence": "high/medium/low",
-    "follow_up_questions": ["specific follow-up question 1", "specific follow-up question 2"]
+    "follow_up_questions": ["follow-up 1", "follow-up 2"]
 }}
-
-STRICT RULES:
-- Only reference code literally shown above
-- Never make up function names or file paths
-- Quote actual code snippets for evidence
-- Return only valid JSON, no markdown backticks"""
+Return only valid JSON, no markdown backticks."""
 
     try:
         gemini = genai.GenerativeModel("gemini-2.5-flash")
         response = gemini.generate_content(prompt)
         raw = response.text.strip()
-
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         raw = raw.strip()
-
         structured = json.loads(raw)
         return {
             "direct_answer": structured.get("direct_answer", ""),
@@ -222,7 +397,6 @@ STRICT RULES:
             "total_files_in_repo": upload_status["total_files"],
             "total_chunks_in_repo": upload_status["total_chunks"]
         }
-
     except json.JSONDecodeError:
         return {
             "direct_answer": "",
@@ -235,214 +409,5 @@ STRICT RULES:
             "total_files_in_repo": upload_status["total_files"],
             "total_chunks_in_repo": upload_status["total_chunks"]
         }
-
-    except Exception as e:
-        raise HTTPException(500, f"Gemini API error: {str(e)}")
-
-@app.get("/status")
-def status():
-    return {
-        "repo_loaded": upload_status["uploaded"],
-        "total_files": upload_status["total_files"],
-        "total_chunks": upload_status["total_chunks"]
-    }
-
-@app.get("/explain")
-async def explain_file(filepath: str):
-    chunks = get_all_chunks()
-
-    
-    # Normalize path separators for matching
-    normalized_input = filepath.replace("\\\\", "\\").replace("/", "\\")
-
-    file_chunks = [
-        c for c in chunks
-        if c["metadata"]["filepath"].replace("/", "\\") == normalized_input
-    ]
-
-    if not file_chunks:
-        # Show available files to help debug
-        available = sorted(set(c["metadata"]["filepath"] for c in chunks))
-        raise HTTPException(404, {
-            "error": f"File '{filepath}' not found",
-            "available_files": available[:10]
-        })
-
-    file_content = "\n\n".join([c["text"] for c in file_chunks])
-
-
-    prompt = f"""Analyze this file completely:
-
-{file_content}
-
-Return as JSON:
-{{
-    "purpose": "what this file does and why it exists",
-    "functions": [{{"name": "funcName", "description": "what it does"}}],
-    "dependencies": ["import and why"],
-    "connections": "how this file connects to rest of codebase",
-    "complexity": 7,
-    "complexity_reason": "why this complexity rating"
-}}
-Return only valid JSON, no markdown backticks."""
-
-    try:
-        gemini = genai.GenerativeModel("gemini-2.5-flash")
-        response = gemini.generate_content(prompt)
-        raw = response.text.strip()
-
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        structured = json.loads(raw)
-        return {
-            "filepath": filepath,
-            "chunks_analyzed": len(file_chunks),
-            **structured
-        }
-
-    except json.JSONDecodeError:
-        return {
-            "filepath": filepath,
-            "chunks_analyzed": len(file_chunks),
-            "explanation": response.text
-        }
-
     except Exception as e:
         raise HTTPException(500, f"Gemini error: {str(e)}")
-        
-@app.get("/summary")
-def get_summary():
-    """
-    Returns the auto-generated repo summary.
-    Available immediately after upload.
-    """
-    if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet.")
-    
-    if not upload_status["summary"]:
-        raise HTTPException(404, "Summary not generated yet. Try re-uploading.")
-    
-    return upload_status["summary"] 
-@app.get("/dependencies")
-def get_dependencies():
-    """
-    Returns rule-based dependency scan results.
-    Fast, accurate, no LLM needed.
-    """
-    if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet.")
-
-    if not upload_status["dependencies"]:
-        raise HTTPException(404, "Dependencies not scanned yet.")
-
-    return upload_status["dependencies"]
-@app.get("/onboard")
-def get_onboarding():
-    """
-    Returns structured onboarding guide for new developers.
-    Includes learning path, key files, prerequisites, first tasks.
-    """
-    if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet.")
-
-    if not upload_status["onboarding"]:
-        raise HTTPException(404, "Onboarding guide not generated yet.")
-
-    return upload_status["onboarding"] 
-class OnboardingQuestion(BaseModel):
-    question: str
-    experience_level: str = "beginner"  # beginner / intermediate / senior
-
-
-@app.post("/onboard/ask")
-async def onboard_ask(body: OnboardingQuestion):
-    """
-    Answer specific onboarding questions with experience-level context.
-    Examples:
-    - 'How do I add a new API endpoint?'
-    - 'Where should I add a new React component?'
-    - 'How does authentication work here?'
-    """
-    if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet.")
-
-    # Retrieve relevant chunks
-    chunks = retrieve(body.question)
-    if not chunks:
-        raise HTTPException(500, "Could not retrieve relevant code.")
-
-    context, filepaths = format_context(chunks)
-
-    # Add onboarding context if available
-    onboard_context = ""
-    if upload_status["onboarding"]:
-        ob = upload_status["onboarding"]
-        onboard_context = f"""
-Project summary: {upload_status['summary'].get('one_liner', '')}
-Key files: {[f['file'] for f in ob.get('key_files_to_read', [])[:3]]}
-"""
-
-    prompt = f"""You are a senior engineer helping a {body.experience_level} developer understand a codebase.
-
-ONBOARDING CONTEXT:
-{onboard_context}
-
-RELEVANT CODE:
-{context}
-
-QUESTION: {body.question}
-
-Return valid JSON:
-{{
-    "answer": "clear explanation tailored for a {body.experience_level}",
-    "relevant_files": ["file1", "file2"],
-    "next_steps": ["what to do after understanding this", "related thing to explore"],
-    "code_example": "relevant code snippet if helpful, empty string if not",
-    "simpler_explanation": "one sentence ELI5 explanation"
-}}
-
-Return only valid JSON, no markdown backticks."""
-
-    try:
-        gemini = genai.GenerativeModel("gemini-2.5-flash")
-        response = gemini.generate_content(prompt)
-        raw = response.text.strip()
-
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        structured = json.loads(raw)
-        return {
-            **structured,
-            "files_searched": filepaths,
-            "experience_level": body.experience_level
-        }
-
-    except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
-    
-@app.get("/security")
-def get_security():
-    """
-    Returns security scan results.
-    Rule-based — instant, no LLM needed.
-    """
-    if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet.")
-    if not upload_status["security"]:
-        raise HTTPException(404, "Security scan not run yet.")
-    return upload_status["security"]
-@app.get("/diagram")
-def get_diagram():
-    if not upload_status["uploaded"]:
-        raise HTTPException(400, "No repo uploaded yet.")
-    if not upload_status["diagram"]:
-        raise HTTPException(404, "Diagram not generated yet.")
-    return upload_status["diagram"]
