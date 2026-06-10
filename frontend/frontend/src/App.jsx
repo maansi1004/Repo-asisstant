@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react"
-import DiagramViewer from "./DiagramViewer"
+import ChatPanel from "./ChatPanel"
+import DiagramViewer from "./Diagramviewer"
 
 const API = "http://localhost:8000"
 
@@ -371,8 +372,10 @@ export default function App() {
             <div style={{ padding: "1.5rem" }}>
 
               {/* Q&A panel */}
-              {activeFeature === "qa" && (
-                <div>
+                {activeFeature === "qa" && (
+  <ChatPanel repoLoaded={!!repoInfo} />
+)}
+                {/* <div>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: "1rem" }}>
                     {SUGGESTED.map(q => (
                       <button key={q} onClick={() => setQuestion(q)} style={{
@@ -491,7 +494,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
-              )}
+        )} */}
 
               {/* Diagram panel */}
               {activeFeature === "diagram" && (

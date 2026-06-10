@@ -1,146 +1,147 @@
-from store import get_collection
+from store import search, get_all_chunks, load_store
 from embedder import embed_query
+from reranker import rerank
 
-# Always include these files regardless of what search returns
-# They give Claude the structural overview of the repo
-ALWAYS_INCLUDE_NAMES = ["readme.md", "main.py", "index.js", "app.py",
-                         "index.ts", "app.ts", "main.go", "config.py",
-                         "settings.py", "package.json", "pyproject.toml"]
+ALWAYS_INCLUDE_NAMES = [
+    "readme.md", "main.py", "index.js", "app.py",
+    "index.ts", "app.ts", "config.py", "settings.py",
+    "server.js", "package.json", "pyproject.toml"
+]
 
-RETRIEVE_CANDIDATES = 20   # fetch top 20 from ChromaDB first
-FINAL_TOP_K = 8          # send only top 5 to Groq
+# How many candidates to fetch before reranking
+# Wider net = better reranking results
+RETRIEVE_CANDIDATES = 20
+
+# How many to send to Gemini after reranking
+FINAL_TOP_K = 5
 
 
 def keyword_score(question: str, text: str) -> float:
-    """
-    Simple keyword overlap score.
-    Counts how many question words appear in the chunk text.
-    Used as the second signal in hybrid search.
-    
-    Returns a float 0.0 to 1.0
-    """
+    """Simple keyword overlap — used as tiebreaker only."""
     question_words = set(question.lower().split())
     text_lower = text.lower()
-
-    # Remove common stop words that add noise
-    stop_words = {"the", "a", "an", "is", "in", "of", "to", "and",
-                  "or", "for", "with", "how", "what", "where", "which", "does"}
+    stop_words = {
+        "the", "a", "an", "is", "in", "of", "to", "and",
+        "or", "for", "with", "how", "what", "where", "which", "does"
+    }
     question_words -= stop_words
-
     if not question_words:
         return 0.0
-
     matches = sum(1 for word in question_words if word in text_lower)
     return matches / len(question_words)
 
 
+def expand_query(question: str) -> str:
+    """
+    Expand short questions with domain-specific terms.
+    Helps embedding model find relevant chunks even when
+    the exact words don't match.
+    """
+    expansions = {
+        "auth": "authentication login logout session token jwt passport oauth middleware verify credentials user signin signup",
+        "login": "login authentication signin credentials username password jwt session token",
+        "database": "database db query model schema table sql orm mongoose prisma sequelize",
+        "api": "api endpoint route handler request response controller express fastapi",
+        "error": "error exception handling try catch logging middleware",
+        "config": "configuration settings environment variables constants dotenv",
+        "payment": "payment stripe checkout billing invoice subscription",
+        "upload": "upload file storage multer s3 cloudinary",
+        "email": "email smtp nodemailer sendgrid notification",
+        "test": "test unittest pytest jest spec describe",
+        "security": "security auth jwt bcrypt cors helmet validation sanitize",
+        "deploy": "deployment docker kubernetes ci cd pipeline",
+        "cache": "cache redis memcache storage session",
+        "websocket": "websocket socket realtime emit listen event",
+        "middleware": "middleware interceptor filter guard pipe decorator",
+    }
+
+    expanded = question
+    question_lower = question.lower()
+    for keyword, expansion in expansions.items():
+        if keyword in question_lower:
+            expanded = f"{question} {expansion}"
+            break
+
+    return expanded
+
+
 def get_always_include_chunks() -> list[dict]:
     """
-    Fetch structural files that should always be in context.
-    These are retrieved by filename match, not by vector search.
+    Fetch structural files that always go into context.
+    These give Gemini the big picture regardless of the question.
     """
-    collection = get_collection()
+    all_chunks = get_all_chunks()
     results = []
+    seen_files = set()
 
-    try:
-        # Query ChromaDB for chunks from important files
-        all_results = collection.get(include=["documents", "metadatas"])
-        if not all_results["ids"]:
-            return []
+    for chunk in all_chunks:
+        filename = chunk["metadata"].get("filename", "").lower()
+        filepath = chunk["metadata"].get("filepath", "")
+        if filename in ALWAYS_INCLUDE_NAMES and filepath not in seen_files:
+            seen_files.add(filepath)
+            results.append({
+                "text": chunk["text"],
+                "metadata": chunk["metadata"],
+                "score": 1.0,
+                "reranker_score": 1.0,
+                "source": "always_include"
+            })
 
-        seen_files = set()
-        for doc, meta in zip(all_results["documents"], all_results["metadatas"]):
-            filename = meta.get("filename", "").lower()
-            filepath = meta.get("filepath", "")
-
-            if filename in ALWAYS_INCLUDE_NAMES and filepath not in seen_files:
-                seen_files.add(filepath)
-                results.append({
-                    "text": doc,
-                    "metadata": meta,
-                    "score": 1.0,  # always-include gets max score
-                    "source": "always_include"
-                })
-
-    except Exception as e:
-        print(f"Could not fetch always-include chunks: {e}")
-
-    return results[:2]  # max 2 always-include so they don't crowd out search results
+    return results[:2]  # max 2 always-include
 
 
 def retrieve(question: str) -> list[dict]:
     """
-    Main retrieval function. Returns top chunks relevant to the question.
-    
-    Process:
-    1. Embed the question
-    2. Fetch top 20 candidates from ChromaDB by vector similarity
-    3. Score each by keyword overlap too (hybrid search)
-    4. Combine scores: 70% vector + 30% keyword
-    5. Sort by combined score
-    6. Add always-include structural files
-    7. Return top FINAL_TOP_K chunks
+    Full retrieval pipeline with reranking:
+
+    1. Expand query for better embedding matching
+    2. Embed expanded query
+    3. Vector search — get top 20 candidates (wide net)
+    4. Rerank — cross-encoder scores all 20, keeps top 5
+    5. Add always-include structural files
+    6. Return final context chunks
+
+    The key improvement over basic retrieval:
+    Step 4 filters out false positives that vector similarity
+    would have included. Cross-encoder is much more precise
+    because it evaluates query + chunk together.
     """
-    collection = get_collection()
 
-    # Step 1 — embed the question
-    q_embedding = embed_query(question)
+    # Step 1: expand query
+    expanded = expand_query(question)
 
-    # Step 2 — vector search: get top 20 candidates
-    try:
-        results = collection.query(
-            query_embeddings=[q_embedding],
-            n_results=min(RETRIEVE_CANDIDATES, collection.count()),
-            include=["documents", "metadatas", "distances"]
-        )
-    except Exception as e:
-        print(f"ChromaDB query failed: {e}")
+    # Step 2: embed
+    q_embedding = embed_query(expanded)
+
+    # Step 3: vector search — get wide set of candidates
+    candidates = search(q_embedding, n_results=RETRIEVE_CANDIDATES)
+
+    if not candidates:
         return []
 
-    if not results["ids"] or not results["ids"][0]:
-        return []
+    # Convert to standard format with scores
+    for c in candidates:
+        c["score"] = c.get("similarity", 0)
+        c["source"] = "search"
 
-    # Step 3 — score each candidate
-    candidates = []
-    for doc, meta, distance in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0]
-    ):
-        # ChromaDB returns cosine distance (lower = more similar)
-        # Convert to similarity score (higher = better)
-        vector_sim = 1 - distance  # now higher = better
+    # Step 4: RERANK — this is the key improvement
+    # Cross-encoder re-scores all 20 candidates against the question
+    # Much more accurate than cosine similarity alone
+    reranked = rerank(question, candidates, top_k=FINAL_TOP_K)
 
-        # Step 4 — hybrid: combine vector + keyword
-        kw_score = keyword_score(question, doc)
-        combined = (vector_sim * 0.7) + (kw_score * 0.3)
-
-        candidates.append({
-            "text": doc,
-            "metadata": meta,
-            "score": round(combined, 4),
-            "vector_sim": round(vector_sim, 4),
-            "keyword_score": round(kw_score, 4),
-            "source": "search"
-        })
-
-    # Step 5 — sort by combined score descending
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-
-    # Step 6 — add always-include structural files
+    # Step 5: add always-include structural files
     always = get_always_include_chunks()
 
-    # Merge: always-include first, then search results
-    # Deduplicate by filepath (don't include same file twice)
+    # Merge — always-include first, then reranked results
     seen_paths = set()
     final = []
 
-    for chunk in always + candidates:
+    for chunk in always + reranked:
         fp = chunk["metadata"].get("filepath", "")
         if fp not in seen_paths:
             seen_paths.add(fp)
             final.append(chunk)
-        if len(final) >= FINAL_TOP_K:
+        if len(final) >= FINAL_TOP_K + len(always):
             break
 
     return final
@@ -148,10 +149,8 @@ def retrieve(question: str) -> list[dict]:
 
 def format_context(chunks: list[dict]) -> tuple[str, list[str]]:
     """
-    Convert retrieved chunks into a prompt-ready string.
-    Also returns a list of filepaths used (for the frontend to display).
-    
-    Returns: (context_string, list_of_filepaths)
+    Format chunks into a prompt-ready context string.
+    Shows reranker score so Gemini knows which chunks are most relevant.
     """
     context_parts = []
     filepaths = []
@@ -159,16 +158,17 @@ def format_context(chunks: list[dict]) -> tuple[str, list[str]]:
     for i, chunk in enumerate(chunks):
         fp = chunk["metadata"].get("filepath", "unknown")
         func = chunk["metadata"].get("func_name", "")
-        score = chunk.get("score", 0)
+        lang = chunk["metadata"].get("language", "")
+        reranker_score = chunk.get("reranker_score", chunk.get("score", 0))
         source = chunk.get("source", "search")
 
-
-
-        confidence = f"{int(score * 100)}%" if source == "search" else "always-include"
-
+        if source == "always_include":
+            relevance = "structural"
+        else:
+            relevance = f"{int(reranker_score * 10) if reranker_score <= 1 else round(reranker_score, 2)}"
 
         context_parts.append(
-            f"--- Source {i+1}: {fp} (function: {func}| relevance: {score} |confidence: {confidence}) ---\n"
+            f"--- [{i+1}] {fp} | fn: {func} | lang: {lang} | relevance: {relevance} ---\n"
             f"{chunk['text']}"
         )
 

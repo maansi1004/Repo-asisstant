@@ -60,6 +60,7 @@ upload_status = {
     "architecture": None,
     "diagram": None,
     "onboarding": None,
+    "chat_history": []   # list of {"question": str, "answer": str, "files": [str]}
 }
 
 
@@ -147,6 +148,7 @@ async def upload_repo(file: UploadFile = File(...)):
             "architecture": None,
             "diagram": None,
             "onboarding": None,
+            "chat_history": []
         })
 
         print("Upload complete. All analysis available on demand.")
@@ -344,6 +346,7 @@ Return only valid JSON, no markdown backticks."""
 
 class QuestionRequest(BaseModel):
     question: str
+    # conversation_id: Optional[str] = None  # for future multi-session support
 
 
 @app.post("/ask")
@@ -353,26 +356,41 @@ async def ask_question(body: QuestionRequest):
     if not body.question.strip():
         raise HTTPException(400, "Question cannot be empty")
 
+    # Retrieve relevant chunks
     chunks = retrieve(body.question)
     if not chunks:
         raise HTTPException(500, "Could not retrieve relevant chunks.")
 
     context, filepaths = format_context(chunks)
 
+    # Build conversation history string for Gemini
+    # Last 3 exchanges only — keeps prompt small
+    history = upload_status.get("chat_history", [])
+    history_text = ""
+    if history:
+        history_text = "\n\nPREVIOUS CONVERSATION:\n"
+        for turn in history[-3:]:  # last 3 exchanges
+            history_text += f"User: {turn['question']}\n"
+            history_text += f"Assistant: {turn['answer']}\n\n"
+
     prompt = f"""You are a senior software engineer analyzing a codebase.
 
 RELEVANT CODE SECTIONS:
 {context}
+{history_text}
+CURRENT QUESTION: {body.question}
 
-QUESTION: {body.question}
+Important: If the question refers to something from the previous conversation 
+(like "it", "that file", "the function you mentioned"), use the conversation 
+history to understand what they're referring to.
 
 Return valid JSON:
 {{
     "direct_answer": "one sentence answer with exact file and function names",
-    "explanation": "detailed step by step explanation",
+    "explanation": "detailed step by step explanation referencing actual code",
     "code_evidence": ["code snippet 1 with filepath", "code snippet 2"],
     "confidence": "high/medium/low",
-    "follow_up_questions": ["follow-up 1", "follow-up 2"]
+    "follow_up_questions": ["specific follow-up 1", "specific follow-up 2", "specific follow-up 3"]
 }}
 Return only valid JSON, no markdown backticks."""
 
@@ -386,28 +404,73 @@ Return only valid JSON, no markdown backticks."""
                 raw = raw[4:]
         raw = raw.strip()
         structured = json.loads(raw)
+
+        answer_text = structured.get("explanation", raw)
+
+        # Save to chat history
+        upload_status["chat_history"].append({
+            "question": body.question,
+            "answer": structured.get("direct_answer", answer_text[:200]),
+            "files": filepaths
+        })
+
+        # Keep history manageable — max 20 exchanges
+        if len(upload_status["chat_history"]) > 20:
+            upload_status["chat_history"] = upload_status["chat_history"][-20:]
+
         return {
             "direct_answer": structured.get("direct_answer", ""),
-            "answer": structured.get("explanation", raw),
+            "answer": answer_text,
             "code_evidence": structured.get("code_evidence", []),
             "confidence": structured.get("confidence", "medium"),
             "follow_up_questions": structured.get("follow_up_questions", []),
             "files_used": filepaths,
             "chunks_retrieved": len(chunks),
             "total_files_in_repo": upload_status["total_files"],
-            "total_chunks_in_repo": upload_status["total_chunks"]
+            "total_chunks_in_repo": upload_status["total_chunks"],
+            "turn_number": len(upload_status["chat_history"])
         }
+
     except json.JSONDecodeError:
+        answer_text = response.text
+        upload_status["chat_history"].append({
+            "question": body.question,
+            "answer": answer_text[:200],
+            "files": filepaths
+        })
         return {
             "direct_answer": "",
-            "answer": response.text,
+            "answer": answer_text,
             "code_evidence": [],
             "confidence": "medium",
             "follow_up_questions": [],
             "files_used": filepaths,
             "chunks_retrieved": len(chunks),
             "total_files_in_repo": upload_status["total_files"],
-            "total_chunks_in_repo": upload_status["total_chunks"]
+            "total_chunks_in_repo": upload_status["total_chunks"],
+            "turn_number": len(upload_status["chat_history"])
         }
+
     except Exception as e:
         raise HTTPException(500, f"Gemini error: {str(e)}")
+
+
+@app.get("/history")
+def get_history():
+    """Returns the full chat history for the current session."""
+    if not upload_status["uploaded"]:
+        raise HTTPException(400, "No repo uploaded yet.")
+    return {
+        "history": upload_status.get("chat_history", []),
+        "total_turns": len(upload_status.get("chat_history", []))
+    }
+
+
+@app.delete("/history")
+def clear_history():
+    """Clear chat history without re-uploading."""
+    upload_status["chat_history"] = []
+    return {"message": "Chat history cleared"}
+
+
+
