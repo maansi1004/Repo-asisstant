@@ -19,6 +19,7 @@ from security_scanner import scan_security
 from summarizer import generate_repo_summary
 from architect import generate_architecture, generate_mermaid_diagram
 from onboarding import generate_onboarding
+from git_analyzer import analyze_git_repo, get_git_summary_for_prompt
 
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -43,7 +44,7 @@ SKIP_DIRS = {
 SKIP_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf",
     ".zip", ".tar", ".gz", ".mp4", ".mp3", ".woff", ".woff2",
-    ".ttf", ".eot", ".lock", ".pyc", ".exe", ".dll", ".bin"
+    ".ttf", ".eot", ".lock", ".pyc", ".exe", ".dll", ".bin",".env",".idea",".vscode"
 }
 
 # Central state — files kept in memory for lazy generation
@@ -60,9 +61,62 @@ upload_status = {
     "architecture": None,
     "diagram": None,
     "onboarding": None,
-    "chat_history": []   # list of {"question": str, "answer": str, "files": [str]}
+    "chat_history": []   # list of {"question": str, "answer": str, "files": [str]},
+    ,
+    "git_data": None,
+    "source": "zip",
+    "github_url": None,
 }
 
+
+def restore_upload_status():
+    """
+    On backend restart, check if ChromaDB already has chunks
+    and restore upload_status so user doesn't need to re-upload.
+    """
+    try:
+        count = chunk_count()
+        if count == 0:
+            return
+
+        # Get all chunks to rebuild file list
+        chunks = get_all_chunks()
+        if not chunks:
+            return
+
+        # Rebuild file list from chunk metadata
+        files = sorted(set(
+            c["metadata"]["filepath"]
+            for c in chunks
+            if "filepath" in c.get("metadata", {})
+        ))
+
+        # Rebuild files_content from chunks
+        # Group chunks by filepath and reconstruct content
+        file_content_map = {}
+        for chunk in chunks:
+            fp = chunk["metadata"].get("filepath", "")
+            if fp and fp not in file_content_map:
+                # Use chunk text as proxy — good enough for lazy generation
+                file_content_map[fp] = chunk["text"]
+
+        upload_status.update({
+            "uploaded": True,
+            "total_files": len(files),
+            "total_chunks": count,
+            "file_list": files,
+            "files_content": file_content_map,
+            "source": "restored",
+        })
+
+        print(f"Restored session — {len(files)} files, {count} chunks from ChromaDB")
+
+    except Exception as e:
+        print(f"Could not restore session: {e}")
+
+
+# Call it at startup
+restore_upload_status()
 
 def read_files_from_zip(zip_path: str, extract_to: str) -> dict:
     files = {}
@@ -274,18 +328,23 @@ def get_onboarding():
 @app.get("/status")
 def status():
     count = chunk_count()
+    git_data = upload_status.get("git_data")
     return {
         "repo_loaded": upload_status["uploaded"],
         "total_files": upload_status["total_files"],
         "total_chunks": upload_status["total_chunks"],
         "chunks_in_store": count,
         "ready": count > 0,
+        "source": upload_status.get("source", "zip"),
+        "github_url": upload_status.get("github_url"),
+        "git_available": git_data is not None and "error" not in (git_data or {}),
         "cached": {
             "summary": upload_status["summary"] is not None,
             "security": upload_status["security"] is not None,
             "architecture": upload_status["architecture"] is not None,
             "diagram": upload_status["diagram"] is not None,
             "onboarding": upload_status["onboarding"] is not None,
+            "git": git_data is not None,
         }
     }
 
@@ -348,6 +407,8 @@ class QuestionRequest(BaseModel):
     question: str
     # conversation_id: Optional[str] = None  # for future multi-session support
 
+# Replace your /ask endpoint in main.py with this version
+# It automatically includes git intelligence in answers when available
 
 @app.post("/ask")
 async def ask_question(body: QuestionRequest):
@@ -356,41 +417,49 @@ async def ask_question(body: QuestionRequest):
     if not body.question.strip():
         raise HTTPException(400, "Question cannot be empty")
 
-    # Retrieve relevant chunks
     chunks = retrieve(body.question)
     if not chunks:
         raise HTTPException(500, "Could not retrieve relevant chunks.")
 
     context, filepaths = format_context(chunks)
 
-    # Build conversation history string for Gemini
-    # Last 3 exchanges only — keeps prompt small
+    # Build conversation history
     history = upload_status.get("chat_history", [])
     history_text = ""
     if history:
         history_text = "\n\nPREVIOUS CONVERSATION:\n"
-        for turn in history[-3:]:  # last 3 exchanges
+        for turn in history[-3:]:
             history_text += f"User: {turn['question']}\n"
             history_text += f"Assistant: {turn['answer']}\n\n"
+
+    # Inject git intelligence if available (V3 feature)
+    git_context = ""
+    git_data = upload_status.get("git_data")
+    if git_data and "error" not in git_data:
+        from git_analyzer import get_git_summary_for_prompt
+        git_context = get_git_summary_for_prompt(git_data)
 
     prompt = f"""You are a senior software engineer analyzing a codebase.
 
 RELEVANT CODE SECTIONS:
 {context}
+{git_context}
 {history_text}
 CURRENT QUESTION: {body.question}
 
-Important: If the question refers to something from the previous conversation 
-(like "it", "that file", "the function you mentioned"), use the conversation 
-history to understand what they're referring to.
+If the question refers to something from the previous conversation
+use the history to understand the reference.
+
+If git intelligence is provided above, use it to give more specific
+answers about file risk, ownership, and stability.
 
 Return valid JSON:
 {{
     "direct_answer": "one sentence answer with exact file and function names",
-    "explanation": "detailed step by step explanation referencing actual code",
-    "code_evidence": ["code snippet 1 with filepath", "code snippet 2"],
+    "explanation": "detailed explanation referencing actual code and git data if relevant",
+    "code_evidence": ["snippet 1 with filepath", "snippet 2"],
     "confidence": "high/medium/low",
-    "follow_up_questions": ["specific follow-up 1", "specific follow-up 2", "specific follow-up 3"]
+    "follow_up_questions": ["follow-up 1", "follow-up 2", "follow-up 3"]
 }}
 Return only valid JSON, no markdown backticks."""
 
@@ -407,14 +476,12 @@ Return only valid JSON, no markdown backticks."""
 
         answer_text = structured.get("explanation", raw)
 
-        # Save to chat history
         upload_status["chat_history"].append({
             "question": body.question,
             "answer": structured.get("direct_answer", answer_text[:200]),
             "files": filepaths
         })
 
-        # Keep history manageable — max 20 exchanges
         if len(upload_status["chat_history"]) > 20:
             upload_status["chat_history"] = upload_status["chat_history"][-20:]
 
@@ -428,19 +495,19 @@ Return only valid JSON, no markdown backticks."""
             "chunks_retrieved": len(chunks),
             "total_files_in_repo": upload_status["total_files"],
             "total_chunks_in_repo": upload_status["total_chunks"],
+            "git_available": git_data is not None and "error" not in (git_data or {}),
             "turn_number": len(upload_status["chat_history"])
         }
 
     except json.JSONDecodeError:
-        answer_text = response.text
         upload_status["chat_history"].append({
             "question": body.question,
-            "answer": answer_text[:200],
+            "answer": response.text[:200],
             "files": filepaths
         })
         return {
             "direct_answer": "",
-            "answer": answer_text,
+            "answer": response.text,
             "code_evidence": [],
             "confidence": "medium",
             "follow_up_questions": [],
@@ -448,11 +515,15 @@ Return only valid JSON, no markdown backticks."""
             "chunks_retrieved": len(chunks),
             "total_files_in_repo": upload_status["total_files"],
             "total_chunks_in_repo": upload_status["total_chunks"],
+            "git_available": False,
             "turn_number": len(upload_status["chat_history"])
         }
 
     except Exception as e:
         raise HTTPException(500, f"Gemini error: {str(e)}")
+
+
+
 
 
 @app.get("/history")
@@ -474,3 +545,233 @@ def clear_history():
 
 
 
+class GithubRequest(BaseModel):
+    url: str
+
+
+@app.post("/upload/github")
+async def upload_from_github(body: GithubRequest):
+    """
+    V3 endpoint — clone a public GitHub repo by URL.
+    Runs full V2 pipeline PLUS git history analysis.
+
+    Gives access to:
+    - churn analysis (which files change most)
+    - ownership detection (who owns each file)
+    - coupling detection (files that break together)
+    - risk ranking (riskiest files to modify)
+    - smart reading order for new developers
+    """
+    url = body.url.strip()
+
+    # Validate URL
+    if not url.startswith("https://github.com/"):
+        raise HTTPException(400, "Please provide a valid GitHub URL like https://github.com/user/repo")
+
+    # Clean URL — remove trailing slash, .git suffix
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+
+    clone_path = tempfile.mkdtemp(dir="D:\\tmp", prefix="v3_clone_")
+
+    try:
+        print(f"Cloning {url}...")
+        import git as gitlib
+        repo = gitlib.Repo.clone_from(url, clone_path, depth=300)
+        print("Clone complete")
+
+    except Exception as e:
+        raise HTTPException(400, f"Could not clone repository: {str(e)}. Make sure it's a public GitHub repo.")
+
+    try:
+        # Read source files — same as ZIP upload
+        files = {}
+        for root, dirs, filenames in os.walk(clone_path):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for filename in filenames:
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, clone_path)
+                if Path(rel_path).suffix.lower() in SKIP_EXTENSIONS:
+                    continue
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    if content.strip():
+                        files[rel_path] = content
+                except Exception:
+                    continue
+
+        if not files:
+            raise HTTPException(400, "No readable files found in repository")
+
+        # V2 pipeline — chunk + embed + store
+        print(f"Chunking {len(files)} files...")
+        chunks = chunk_all_files(files)
+        print(f"Embedding {len(chunks)} chunks...")
+        embedded_chunks = embed_chunks(chunks)
+        reset_collection()
+        save_chunks(embedded_chunks)
+
+        # Dependency scan (free, instant)
+        deps = scan_dependencies(files)
+
+        # V3 — git history analysis
+        print("Running git analysis...")
+        git_data = analyze_git_repo(clone_path)
+
+        # Update state
+        upload_status.update({
+            "uploaded": True,
+            "total_files": len(files),
+            "total_chunks": len(embedded_chunks),
+            "file_list": sorted(files.keys()),
+            "files_content": files,
+            "dependencies": deps,
+            "git_data": git_data,
+            # Reset lazy features
+            "summary": None,
+            "security": None,
+            "architecture": None,
+            "diagram": None,
+            "onboarding": None,
+            "chat_history": [],
+            "source": "github",
+            "github_url": url,
+        })
+
+        # Build response
+        repo_stats = git_data.get("repo_stats", {})
+
+        return {
+            "success": True,
+            "source": "github",
+            "url": url,
+            "total_files": len(files),
+            "total_chunks": len(embedded_chunks),
+            "files": sorted(files.keys()),
+            "dependencies": deps,
+            "git_available": "error" not in git_data,
+            "git_stats": repo_stats,
+        }
+
+    finally:
+        shutil.rmtree(clone_path, ignore_errors=True)
+
+
+# 4. Add these new git endpoints:
+
+@app.get("/git/churn")
+def get_churn():
+    """Returns file churn data — which files change most often."""
+    if not upload_status.get("git_data"):
+        raise HTTPException(400, "No git data. Use /upload/github endpoint.")
+    if "error" in upload_status["git_data"]:
+        raise HTTPException(400, upload_status["git_data"]["error"])
+
+    churn = upload_status["git_data"]["churn"]
+    sorted_churn = sorted(
+        [{"file": k, **v} for k, v in churn.items()],
+        key=lambda x: x["churn_score"],
+        reverse=True
+    )
+    return {
+        "churn": sorted_churn[:30],
+        "total_files_tracked": len(churn)
+    }
+
+
+@app.get("/git/ownership")
+def get_ownership():
+    """Returns file ownership — who owns each file."""
+    if not upload_status.get("git_data"):
+        raise HTTPException(400, "No git data. Use /upload/github endpoint.")
+
+    if "error" in upload_status["git_data"]:
+        raise HTTPException(400, upload_status["git_data"]["error"])
+
+    ownership = upload_status["git_data"]["ownership"]
+    return {
+        "ownership": ownership,
+        "total_files": len(ownership)
+    }
+
+
+@app.get("/git/coupling")
+def get_coupling():
+    """Returns file coupling — files that always change together."""
+    if not upload_status.get("git_data"):
+        raise HTTPException(400, "No git data. Use /upload/github endpoint.")
+
+    if "error" in upload_status["git_data"]:
+        raise HTTPException(400, upload_status["git_data"]["error"])
+
+    return {
+        "coupling": upload_status["git_data"]["coupling"],
+        "insight": "Files that frequently change together are tightly coupled. Modifying one likely requires modifying the other."
+    }
+
+
+@app.get("/git/risk")
+def get_risk():
+    """Returns risk ranking — riskiest files to modify."""
+    if not upload_status.get("git_data"):
+        raise HTTPException(400, "No git data. Use /upload/github endpoint.")
+
+    if "error" in upload_status["git_data"]:
+        raise HTTPException(400, upload_status["git_data"]["error"])
+
+    return {
+        "risk_ranking": upload_status["git_data"]["risk_ranking"],
+        "reading_order": upload_status["git_data"]["reading_order"],
+        "repo_stats": upload_status["git_data"]["repo_stats"]
+    }
+
+
+@app.get("/git/summary")
+def get_git_summary():
+    """Returns a complete git intelligence summary."""
+    if not upload_status.get("git_data"):
+        raise HTTPException(400, "No git data. Use /upload/github endpoint.")
+
+    gd = upload_status["git_data"]
+    if "error" in gd:
+        raise HTTPException(400, gd["error"])
+
+    stats = gd["repo_stats"]
+    risk = gd["risk_ranking"]
+    reading = gd["reading_order"]
+    coupling = gd["coupling"]
+
+    high_risk = [r for r in risk if r["risk_level"] == "high"]
+    medium_risk = [r for r in risk if r["risk_level"] == "medium"]
+
+    return {
+        "repo_stats": stats,
+        "risk_summary": {
+            "high_risk_files": high_risk[:5],
+            "medium_risk_files": medium_risk[:5],
+            "safest_files": risk[-5:][::-1] if len(risk) >= 5 else []
+        },
+        "reading_order": reading[:10],
+        "top_coupling": coupling[:5],
+        "key_insights": [
+            f"Most active contributor: {stats.get('most_active_author', 'unknown')}",
+            f"Analyzed {stats.get('total_commits_analyzed', 0)} commits across {stats.get('total_authors', 0)} authors",
+            f"{len(high_risk)} high-risk files detected",
+            f"Top coupled pair: {coupling[0]['file_a']} ↔ {coupling[0]['file_b']} ({coupling[0]['co_changes']} co-changes)" if coupling else "No strong coupling detected"
+        ]
+    }
+@app.post("/restore")
+def manual_restore():
+    """
+    Manually trigger session restore from ChromaDB.
+    Useful if auto-restore didn't work.
+    """
+    restore_upload_status()
+    return {
+        "restored": upload_status["uploaded"],
+        "total_files": upload_status["total_files"],
+        "total_chunks": upload_status["total_chunks"],
+        "message": "Session restored from ChromaDB" if upload_status["uploaded"] else "No data found in ChromaDB"
+    }
