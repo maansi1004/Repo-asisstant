@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react"
 import DiagramViewer from "./DiagramViewer"
 import ChatPanel from "./ChatPanel"
 import GitIntelPanel from "./GitPanel"
+import AuthPage from "./AuthPage"
 
 const API = "http://localhost:8000"
 
@@ -43,8 +44,30 @@ const FEATURES = [
     badge: "V3"
   },
 ]
+function AppWithAuth() {
+  const [user, setUser] = useState(null)
+  const [authChecked, setAuthChecked] = useState(false)
 
-export default function App() {
+  useEffect(() => {
+    const savedToken = localStorage.getItem("code_intel_token")
+    const savedUser = localStorage.getItem("code_intel_user")
+    if (savedToken && savedUser) {
+      try { setUser(JSON.parse(savedUser)) }
+      catch (e) { localStorage.removeItem("code_intel_user") }
+    }
+    setAuthChecked(true)
+  }, [])
+
+  if (!authChecked) return null
+  if (!user) return <AuthPage onLogin={(u) => setUser(u)} />
+  return <App user={user} onLogout={() => {
+    localStorage.removeItem("code_intel_token")
+    localStorage.removeItem("code_intel_user")
+    setUser(null)
+  }} />
+}
+
+function App({ user, onLogout })  {
   const [repoInfo, setRepoInfo] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState("")
@@ -82,6 +105,37 @@ export default function App() {
     checkExistingSession()
   }, [])
 
+  useEffect(() => {
+    async function checkExistingSession() {
+        try {
+            const savedToken = localStorage.getItem("code_intel_token")
+            const savedUser = localStorage.getItem("code_intel_user")
+            
+            if (savedToken && savedUser) {
+                const userData = JSON.parse(savedUser)
+                setToken(savedToken)
+                setUser(userData)
+                
+                // Check if backend has data for THIS user
+                const res = await fetch(`${API}/status`, {
+                    headers: { "Authorization": `Bearer ${savedToken}` }
+                })
+                const data = await res.json()
+                if (data.repo_loaded) {
+                    setRepoInfo({
+                        total_files: data.total_files,
+                        total_chunks: data.total_chunks,
+                        files: [],
+                        source: data.source || "restored"
+                    })
+                }
+            }
+        } catch (e) {
+            console.log("No existing session")
+        }
+    }
+    checkExistingSession()
+}, [])
   async function handleZipUpload(file) {
     if (!file || !file.name.endsWith(".zip")) {
       setUploadError("Please select a .zip file")
@@ -181,26 +235,49 @@ export default function App() {
 
         {/* Header */}
         <header style={{
-          padding: "1.75rem 0 1rem", display: "flex",
-          alignItems: "center", justifyContent: "space-between",
-          borderBottom: "1px solid rgba(255,255,255,0.05)"
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{
-              width: 34, height: 34, borderRadius: 9,
-              background: "linear-gradient(135deg,#6366f1,#8b5cf6)",
-              display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 16, color: "#fff", fontWeight: 700
-            }}>◈</div>
-            <div>
-              <div style={{ fontSize: 16, fontWeight: 700, color: "#f1f5f9", letterSpacing: "-0.3px" }}>Code Intel</div>
-              <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.06em" }}>REPOSITORY INTELLIGENCE</div>
-            </div>
-          </div>
-          <div style={{ fontSize: 11, color: "#334155", padding: "4px 12px", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20 }}>
-            Gemini · ChromaDB · GitPython
-          </div>
-        </header>
+  padding: "1.75rem 0 1rem", display: "flex",
+  alignItems: "center", justifyContent: "space-between",
+  borderBottom: "1px solid rgba(255,255,255,0.05)"
+}}>
+  {/* Left — logo */}
+  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+    <div style={{
+      width: 34, height: 34, borderRadius: 9,
+      background: "linear-gradient(135deg,#6366f1,#8b5cf6)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      fontSize: 16, color: "#fff", fontWeight: 700
+    }}>◈</div>
+    <div>
+      <div style={{ fontSize: 16, fontWeight: 700, color: "#f1f5f9" }}>Code Intel</div>
+      <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.06em" }}>REPOSITORY INTELLIGENCE</div>
+    </div>
+  </div>
+
+  {/* Right — pill + user menu */}
+  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+    <div style={{ fontSize: 11, color: "#334155", padding: "4px 12px", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20 }}>
+      Gemini · ChromaDB · GitPython
+    </div>
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{ fontSize: 12, color: "#475569" }}>{user?.name}</div>
+      <div style={{
+        width: 30, height: 30, borderRadius: "50%",
+        background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 12, color: "#fff", fontWeight: 700
+      }}>
+        {user?.name?.[0]?.toUpperCase()}
+      </div>
+      <button onClick={onLogout} style={{
+        fontSize: 12, color: "#475569", background: "none",
+        border: "1px solid rgba(255,255,255,0.06)",
+        borderRadius: 6, padding: "4px 10px", cursor: "pointer"
+      }}>
+        Sign out
+      </button>
+    </div>
+  </div>
+</header>
 
         {/* Hero */}
         <section style={{
@@ -665,3 +742,5 @@ function MiniSpinner({ size = 18, color = "#6366f1" }) {
     </svg>
   )
 }
+
+export default AppWithAuth

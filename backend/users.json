@@ -1,0 +1,51 @@
+{
+  "hello123@gmail.com": {
+    "email": "hello123@gmail.com",
+    "name": "hello",
+    "password_hash": "$2b$12$FhF3JOemve9spfSECiYyt.VQzknCRYk5jI539pVK8ZXWfW.I8CGVa",
+    "created_at": "2026-06-14T11:53:17.483485+00:00",
+    "plan": "free"
+  },
+  "hello1234@gmail.com": {
+    "email": "hello1234@gmail.com",
+    "name": "hello",
+    "password_hash": "$2b$12$IYLcFmi0XtAMod919kDkwOlwkcJPHhTjC9RC62rG9Wo9wJ30JyqBS",
+    "created_at": "2026-06-14T11:53:52.973072+00:00",
+    "plan": "free"
+  },
+  "maansi@gmail.com": {
+    "email": "maansi@gmail.com",
+    "name": "maansi",
+    "password_hash": "$2b$12$1EImv5wOwk1yKX1BgdMjaOMiaD.l548avpVEDwEvku1coZTqwYUaq",
+    "created_at": "2026-06-14T11:54:30.011530+00:00",
+    "plan": "free"
+  },
+  "examplre@mail.com": {
+    "email": "examplre@mail.com",
+    "name": "example",
+    "password_hash": "$2b$12$Fr/zL2a3rkNg3zCGsHm5deEO4iBs5YYxsxt540kunyVAZr7rKSFfK",
+    "created_at": "2026-06-14T12:15:05.587784+00:00",
+    "plan": "free"
+  },
+  "gini@mail.com": {
+    "email": "gini@mail.com",
+    "name": "giniii",
+    "password_hash": "$2b$12$tX9TIlj98ILOAbKujIRgke3zTD.C.WHPvNRKlSv.AnjJ10mns8bUG",
+    "created_at": "2026-06-14T12:35:18.854081+00:00",
+    "plan": "free"
+  },
+  "ginu@mail.com": {
+    "email": "ginu@mail.com",
+    "name": "ginnu",
+    "password_hash": "$2b$12$1dmopS6dz0MgBLNbXRAcMeZpfglexqryF5OkrLNEWkyb4cNOQHv8G",
+    "created_at": "2026-06-14T12:37:49.623959+00:00",
+    "plan": "free"
+  },
+  "maansi10@gmail.com": {
+    "email": "maansi10@gmail.com",
+    "name": "maansi1004",
+    "password_hash": "$2b$12$y9ihvfjBajF8Rmwa8YKRTu.9qxUJ5hasEjwCT/DZbuwmFyT7Ubjzu",
+    "created_at": "2026-06-14T12:38:35.064916+00:00",
+    "plan": "free"
+  }
+}

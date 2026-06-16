@@ -3,8 +3,11 @@ import zipfile
 import tempfile
 import shutil
 import json
+from auth import (RegisterRequest, LoginRequest, create_user,
+                  get_user, verify_password, create_access_token,
+                  get_current_user, get_optional_user)
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
@@ -67,6 +70,27 @@ upload_status = {
     "source": "zip",
     "github_url": None,
 }
+
+
+def reset_upload_status():
+    """Clear the in-memory repo session so the next sign-in starts fresh."""
+    upload_status.update({
+        "uploaded": False,
+        "total_files": 0,
+        "total_chunks": 0,
+        "file_list": [],
+        "files_content": {},
+        "summary": None,
+        "dependencies": None,
+        "security": None,
+        "architecture": None,
+        "diagram": None,
+        "onboarding": None,
+        "chat_history": [],
+        "git_data": None,
+        "source": "zip",
+        "github_url": None,
+    })
 
 
 def restore_upload_status():
@@ -775,3 +799,60 @@ def manual_restore():
         "total_chunks": upload_status["total_chunks"],
         "message": "Session restored from ChromaDB" if upload_status["uploaded"] else "No data found in ChromaDB"
     }
+# Add these to main.py
+# 1. Add import at top: from auth import RegisterRequest, LoginRequest, create_user, get_user, verify_password, create_access_token, get_current_user, get_optional_user
+# 2. Paste all endpoints below into main.py
+
+@app.post("/auth/register")
+def register(body: RegisterRequest):
+    """
+    Register a new user.
+    Stores email + bcrypt hashed password in users.json on D drive.
+    Returns JWT token immediately so user is logged in after register.
+    """
+    if len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    if "@" not in body.email:
+        raise HTTPException(400, "Invalid email address")
+    if len(body.name.strip()) < 2:
+        raise HTTPException(400, "Name must be at least 2 characters")
+
+    user = create_user(body.email, body.password, body.name.strip())
+    token = create_access_token({"sub": user["email"]})
+    reset_upload_status()
+
+    return {
+        "message": "Account created successfully",
+        "token": token,
+        "user": user
+    }
+
+
+@app.post("/auth/login")
+def login(body: LoginRequest):
+    user = get_user(body.email)
+    if not user or not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+
+    token = create_access_token({"sub": user["email"]})
+    reset_upload_status()
+
+    return {
+        "message": "Logged in successfully",
+        "token": token,
+        "user": {k: v for k, v in user.items() if k != "password_hash"}
+    }
+
+@app.get("/auth/me")
+def get_me(current_user = Depends(get_current_user)):
+    """Returns current logged-in user info."""
+    return current_user
+
+
+@app.post("/auth/logout")
+def logout():
+    """
+    Logout — client should delete the token.
+    JWT is stateless so server just confirms.
+    """
+    return {"message": "Logged out successfully"}
