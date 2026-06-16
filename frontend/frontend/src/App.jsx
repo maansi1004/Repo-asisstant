@@ -29,7 +29,7 @@ const FEATURES = [
   },
   {
     id: "diagram", icon: "◇", title: "Architecture Diagram",
-    description: "Generates Mermaid diagrams with actual filenames grouped by layer.",
+    description: "Generates architecture diagrams with actual filenames grouped by layer.",
     endpoint: "/diagram", color: "#8b5cf6", glow: "rgba(139,92,246,0.12)", isDiagram: true
   },
   {
@@ -248,8 +248,8 @@ function App({ user, onLogout })  {
       fontSize: 16, color: "#fff", fontWeight: 700
     }}>◈</div>
     <div>
-      <div style={{ fontSize: 16, fontWeight: 700, color: "#f1f5f9" }}>Code Intel</div>
-      <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.06em" }}>REPOSITORY INTELLIGENCE</div>
+      <div style={{ fontSize: 16, fontWeight: 700, color: "#f1f5f9" }}>Repo Assistant</div>
+      <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.06em" }}>REPOSITORY INTELLIGENCE </div>
     </div>
   </div>
 
@@ -259,7 +259,7 @@ function App({ user, onLogout })  {
       Gemini · ChromaDB · GitPython
     </div>
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{ fontSize: 12, color: "#475569" }}>{user?.name}</div>
+      <div style={{ fontSize: 12, color: "#94a3b8" }}>{user?.name}</div>
       <div style={{
         width: 30, height: 30, borderRadius: "50%",
         background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
@@ -269,7 +269,7 @@ function App({ user, onLogout })  {
         {user?.name?.[0]?.toUpperCase()}
       </div>
       <button onClick={onLogout} style={{
-        fontSize: 12, color: "#475569", background: "none",
+        fontSize: 12, color: "#94a3b8", background: "none",
         border: "1px solid rgba(255,255,255,0.06)",
         borderRadius: 6, padding: "4px 10px", cursor: "pointer"
       }}>
@@ -291,7 +291,7 @@ function App({ user, onLogout })  {
             border: "1px solid rgba(129,140,248,0.25)", background: "rgba(99,102,241,0.07)",
             marginBottom: "1.25rem"
           }}>
-            SEMANTIC RAG · GIT INTELLIGENCE · V3
+            SEMANTIC RAG · GIT INTELLIGENCE 
           </div>
 
           <h1 style={{
@@ -395,7 +395,7 @@ function App({ user, onLogout })  {
                 <div>
                   <div style={{ fontSize: 24, marginBottom: 6, opacity: 0.5 }}>⬆</div>
                   <p style={{ color: "#94a3b8", fontWeight: 500, margin: "0 0 2px", fontSize: 14 }}>Drop .zip here</p>
-                  <p style={{ color: "#334155", fontSize: 12, margin: 0 }}>No git history (use URL above for V3)</p>
+                  <p style={{ color: "#94a3b8", fontSize: 12, margin: 0 }}>No git history (use URL above for Git Intelligence Features)</p>
                 </div>
               )}
             </div>
